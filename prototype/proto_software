@@ -1,0 +1,346 @@
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SerialFlash.h>
+#include <Bounce.h>
+#include <Encoder.h>
+
+// ----------------- Pin assignments -----------------
+const int togglePins[3] = {1, 2, 3};   // Original toggle switches (optional now)
+const int ledPins[3]    = {41, 40, 39}; // LEDs
+
+// ----------------- Rotary Encoder Pins -----------------
+// Encoder 1: Bass control (CLK, DT, SW)
+Encoder encBass(4, 5);
+const int SW_BASS = 6;
+
+// Encoder 2: Reverb control (CLK, DT, SW)  
+Encoder encReverb(9, 10);
+const int SW_REVERB = 11;
+
+// Encoder 3: Tremolo control (CLK, DT, SW)
+Encoder encTremolo(12, 24);
+const int SW_TREMOLO = 25;
+
+// Bounce objects for encoder switch debouncing
+Bounce bassButton = Bounce(SW_BASS, 10);
+Bounce reverbButton = Bounce(SW_REVERB, 10);
+Bounce tremoloButton = Bounce(SW_TREMOLO, 10);
+
+// ----------------- Audio objects -----------------
+const int MY_INPUT = AUDIO_INPUT_LINEIN;
+
+AudioInputI2S       audioInput;
+
+// TWO cascaded bass shelves
+AudioFilterBiquad   bassBoost1;
+AudioFilterBiquad   bassBoost2;
+
+// Reverb + mixer
+AudioEffectReverb   reverb;
+AudioMixer4         reverbMixer;
+
+// ----------- TREMOLO EFFECT -----------
+AudioEffectMultiply tremoloMultiplier;
+AudioSynthWaveform  tremoloLFO;
+AudioMixer4         tremoloOffsetMixer;  
+// ---------------------------------------
+
+AudioOutputI2S      audioOutput;
+AudioControlSGTL5000 audioShield;
+
+// dynamic patch cables
+AudioConnection* patch[30];
+
+// Which effects are on {bass, reverb, tremolo}
+bool effectActive[3] = {false, false, false};
+
+// Original toggle switch debounce
+unsigned long lastToggleTime[3] = {0,0,0};
+bool lastToggleRaw[3] = {HIGH, HIGH, HIGH};
+const unsigned long debounceMs = 20;
+
+// Effect parameters with rotary encoder control
+float reverbWet = 0.5f;      // 0.0 to 1.0 - controlled by encoder
+float bassGain1 = 6.0f;      // 0 to 20 dB - controlled by encoder  
+float bassGain2 = 8.0f;      // 0 to 20 dB - follows bassGain1 with offset
+float bassFreq  = 60.0f;     // Fixed frequency
+float bassQ     = 0.7f;      // Fixed Q
+float tremoloAmplitude = 0.3f; // 0.0 to 1.0 - controlled by encoder
+float tremoloFrequency = 4.0f; // Fixed tremolo speed
+
+// Previous encoder positions for detecting changes
+long encBassPos = 0;
+long encReverbPos = 0;
+long encTremoloPos = 0;
+
+// Track last encoder button states
+bool lastBassButtonState = HIGH;
+bool lastReverbButtonState = HIGH;
+bool lastTremoloButtonState = HIGH;
+
+// Function prototypes
+void deleteAllConnections();
+void setupBassFilters();
+void updateBassFromEncoder();
+void updateReverbFromEncoder();
+void updateTremoloFromEncoder();
+void setupTremolo();
+void setupAudioConnections();
+
+void deleteAllConnections() {
+  for (int i = 0; i < 30; i++) {
+    if (patch[i]) {
+      delete patch[i];
+      patch[i] = nullptr;
+    }
+  }
+}
+
+void setupBassFilters() {
+  bassBoost1.setLowShelf(0, bassFreq, bassQ, bassGain1);
+  bassBoost2.setLowShelf(0, bassFreq, bassQ, bassGain2);
+}
+
+void updateBassFromEncoder() {
+  // Keep bassGain2 slightly higher than bassGain1 for cascaded effect
+  bassGain2 = bassGain1 + 2.0f;
+  setupBassFilters();
+  if (effectActive[0]) {
+    Serial.print("Bass Gain: ");
+    Serial.print(bassGain1);
+    Serial.print("dB, ");
+    Serial.print(bassGain2);
+    Serial.println("dB");
+  }
+}
+
+void updateReverbFromEncoder() {
+  reverbMixer.gain(1, reverbWet);
+  if (effectActive[1]) {
+    Serial.print("Reverb Wet Level: ");
+    Serial.println(reverbWet);
+  }
+}
+
+void updateTremoloFromEncoder() {
+  tremoloLFO.amplitude(tremoloAmplitude);
+  if (effectActive[2]) {
+    Serial.print("Tremolo Amplitude: ");
+    Serial.println(tremoloAmplitude);
+  }
+}
+
+void setupTremolo() {
+  // Configure LFO
+  tremoloLFO.begin(WAVEFORM_SINE);
+  tremoloLFO.frequency(tremoloFrequency);
+  tremoloLFO.amplitude(tremoloAmplitude);
+
+  // Offset mixer to shift LFO from -1..+1 to 0..1
+  tremoloOffsetMixer.gain(0, 0.5f);   // (LFO * 0.5)
+  tremoloOffsetMixer.gain(1, 0.5f);   // DC offset = +0.5
+}
+
+// Build the DSP routing graph
+void setupAudioConnections() {
+  AudioNoInterrupts();
+  deleteAllConnections();
+
+  int n = 0;
+  AudioStream* current = &audioInput;
+
+  // ---------- BASS BOOST BLOCK ----------
+  if (effectActive[0]) {
+    patch[n++] = new AudioConnection(*current, 0, bassBoost1, 0);
+    current = &bassBoost1;
+
+    patch[n++] = new AudioConnection(*current, 0, bassBoost2, 0);
+    current = &bassBoost2;
+  }
+
+  // ---------- REVERB BLOCK (dry + wet) ----------
+  if (effectActive[1]) {
+    patch[n++] = new AudioConnection(*current, 0, reverb, 0);
+    patch[n++] = new AudioConnection(*current, 0, reverbMixer, 0);
+    patch[n++] = new AudioConnection(reverb, 0, reverbMixer, 1);
+
+    reverbMixer.gain(0, 1.0f);
+    reverbMixer.gain(1, reverbWet);
+
+    current = &reverbMixer;
+  }
+
+  // ---------- TREMOLO EFFECT ----------
+  if (effectActive[2]) {
+    // current audio → multiplier input 0
+    patch[n++] = new AudioConnection(*current, 0, tremoloMultiplier, 0);
+
+    // LFO → offset mixer → multiplier input 1
+    patch[n++] = new AudioConnection(tremoloLFO, 0, tremoloOffsetMixer, 0);
+
+    // Constant DC offset to convert -1..1 into 0..1
+    static AudioSynthWaveform dcSource;
+    dcSource.begin(WAVEFORM_SINE);
+    dcSource.amplitude(1.0f);
+    dcSource.frequency(0.1f); // Very slow sine wave as DC source
+
+    patch[n++] = new AudioConnection(dcSource, 0, tremoloOffsetMixer, 1);
+
+    // Offset mixer → multiplier control
+    patch[n++] = new AudioConnection(tremoloOffsetMixer, 0, tremoloMultiplier, 1);
+
+    current = &tremoloMultiplier;
+  }
+
+  // ---------- OUTPUT ----------
+  patch[n++] = new AudioConnection(*current, 0, audioOutput, 0);
+  patch[n++] = new AudioConnection(*current, 0, audioOutput, 1);
+
+  AudioInterrupts();
+}
+
+void handleRotaryEncoders() {
+  // Bass encoder - controls bass gain
+  long newBassPos = encBass.read();
+  if (newBassPos != encBassPos) {
+    // Each encoder step changes gain by 0.5 dB
+    bassGain1 = constrain(bassGain1 + (newBassPos - encBassPos) * 0.5, 0.0, 20.0);
+    encBassPos = newBassPos;
+    updateBassFromEncoder();
+  }
+  
+  // Reverb encoder - controls wet level
+  long newReverbPos = encReverb.read();
+  if (newReverbPos != encReverbPos) {
+    // Each encoder step changes wet level by 0.05
+    reverbWet = constrain(reverbWet + (newReverbPos - encReverbPos) * 0.05, 0.0, 1.0);
+    encReverbPos = newReverbPos;
+    updateReverbFromEncoder();
+  }
+  
+  // Tremolo encoder - controls amplitude
+  long newTremoloPos = encTremolo.read();
+  if (newTremoloPos != encTremoloPos) {
+    // Each encoder step changes amplitude by 0.05
+    tremoloAmplitude = constrain(tremoloAmplitude + (newTremoloPos - encTremoloPos) * 0.05, 0.0, 1.0);
+    encTremoloPos = newTremoloPos;
+    updateTremoloFromEncoder();
+  }
+}
+
+void handleEncoderButtons() {
+  // Update bounce objects
+  bassButton.update();
+  reverbButton.update();
+  tremoloButton.update();
+  
+  // Check for button presses (falling edge)
+  if (bassButton.fallingEdge()) {
+    effectActive[0] = !effectActive[0];
+    digitalWrite(ledPins[0], effectActive[0] ? HIGH : LOW);
+    setupAudioConnections();
+    Serial.print("Bass: ");
+    Serial.println(effectActive[0] ? "ON" : "OFF");
+  }
+  
+  if (reverbButton.fallingEdge()) {
+    effectActive[1] = !effectActive[1];
+    digitalWrite(ledPins[1], effectActive[1] ? HIGH : LOW);
+    setupAudioConnections();
+    Serial.print("Reverb: ");
+    Serial.println(effectActive[1] ? "ON" : "OFF");
+  }
+  
+  if (tremoloButton.fallingEdge()) {
+    effectActive[2] = !effectActive[2];
+    digitalWrite(ledPins[2], effectActive[2] ? HIGH : LOW);
+    setupAudioConnections();
+    Serial.print("Tremolo: ");
+    Serial.println(effectActive[2] ? "ON" : "OFF");
+  }
+}
+
+void handleToggleSwitches() {
+  // Optional: Keep toggle switch functionality if you want both
+  for (int i = 0; i < 3; i++) {
+    bool raw = digitalRead(togglePins[i]);
+
+    if (raw != lastToggleRaw[i]) {
+      lastToggleTime[i] = millis();
+      lastToggleRaw[i] = raw;
+    } else {
+      if (millis() - lastToggleTime[i] > debounceMs) {
+        bool active = !raw;
+
+        if (active != effectActive[i]) {
+          effectActive[i] = active;
+          digitalWrite(ledPins[i], active ? HIGH : LOW);
+          setupAudioConnections();
+          
+          Serial.print("Effect ");
+          Serial.print(i);
+          Serial.print(" (");
+          switch(i) {
+            case 0: Serial.print("Bass"); break;
+            case 1: Serial.print("Reverb"); break;
+            case 2: Serial.print("Tremolo"); break;
+          }
+          Serial.print("): ");
+          Serial.println(active ? "ON" : "OFF");
+        }
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(20);
+
+  // Initialize pins
+  for (int i = 0; i < 3; i++) {
+    pinMode(togglePins[i], INPUT_PULLUP);
+    pinMode(ledPins[i], OUTPUT);
+    digitalWrite(ledPins[i], LOW);
+    lastToggleRaw[i] = digitalRead(togglePins[i]);
+  }
+
+  // Initialize encoder switch pins with pullup
+  pinMode(SW_BASS, INPUT_PULLUP);
+  pinMode(SW_REVERB, INPUT_PULLUP);
+  pinMode(SW_TREMOLO, INPUT_PULLUP);
+
+  AudioMemory(30);
+
+  // Audio shield setup
+  audioShield.enable();
+  delay(50);
+  audioShield.inputSelect(MY_INPUT);
+  audioShield.micGain(0);  // Disable mic preamp
+  audioShield.lineInLevel(2);
+  audioShield.volume(0.85);
+
+  // Initialize effects
+  setupBassFilters();
+  setupTremolo();
+  reverb.reverbTime(1.2f);
+
+  // Set up initial audio connections
+  setupAudioConnections();
+
+  Serial.println("Audio Effects Box Ready");
+  Serial.println("Encoder buttons toggle effects");
+  Serial.println("Encoder rotation adjusts effect strength");
+  Serial.println("Toggle switches also work (optional)");
+}
+
+void loop() {
+  // Handle both toggle switches (optional) and encoder buttons
+  handleToggleSwitches();      // If you still want toggle switches
+  handleEncoderButtons();      // New: encoder click toggles
+  handleRotaryEncoders();      // New: encoder rotation adjusts strength
+
+  delay(10);
+}
